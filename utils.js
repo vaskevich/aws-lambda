@@ -5,9 +5,21 @@ const globby = require('globby')
 const { contains, isNil, last, split, equals, not, pick } = require('ramda')
 const { readFile, createReadStream, createWriteStream } = require('fs-extra')
 const { utils } = require('@serverless/core')
+const fs = require('fs')
+const util = require('util')
 
 const VALID_FORMATS = ['zip', 'tar']
 const isValidFormat = (format) => contains(format, VALID_FORMATS)
+
+const augmentWithFileModes = async (files) => {
+  const promisingStat = util.promisify(fs.stat)
+  const promises = files.map((file) => (
+    promisingStat(file.input).then((stats) => (
+      Object.assign(file, { mode: (stats.mode & 0o777) })
+    ))
+  ))
+  return Promise.all(promises)
+}
 
 const packDir = async (inputDirPath, outputFilePath, include = [], exclude = [], prefix) => {
   const format = last(split('.', outputFilePath))
@@ -22,12 +34,21 @@ const packDir = async (inputDirPath, outputFilePath, include = [], exclude = [],
     exclude.forEach((excludedItem) => patterns.push(`!${excludedItem}`))
   }
 
-  const files = (await globby(patterns, { cwd: inputDirPath, dot: true }))
+  let files = (await globby(patterns, { cwd: inputDirPath, dot: true }))
     .sort() // we must sort to ensure correct hash
     .map((file) => ({
       input: path.join(inputDirPath, file),
       output: prefix ? path.join(prefix, file) : file
     }))
+
+  if (!isNil(include)) {
+    files = files.concat(include.map((file) => ({
+      input: file,
+      output: path.basename(file)
+    })))
+  }
+
+  files = await augmentWithFileModes(files)
 
   return new Promise((resolve, reject) => {
     const output = createWriteStream(outputFilePath)
@@ -40,15 +61,8 @@ const packDir = async (inputDirPath, outputFilePath, include = [], exclude = [],
 
       // we must set the date to ensure correct hash
       files.forEach((file) =>
-        archive.append(createReadStream(file.input), { name: file.output, date: new Date(0) })
+        archive.append(createReadStream(file.input), { name: file.output, date: new Date(0), mode: file.mode })
       )
-
-      if (!isNil(include)) {
-        include.forEach((file) => {
-          const stream = createReadStream(file)
-          archive.append(stream, { name: path.basename(file), date: new Date(0) })
-        })
-      }
 
       archive.finalize()
     })
